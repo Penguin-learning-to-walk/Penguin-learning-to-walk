@@ -1,1 +1,244 @@
+#include <stdio.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <ev.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <pthread.h>
+#include <unistd.h>
 
+// Объявляем переменные -----------------------------------------------------------
+struct ev_loop* loop;
+struct ev_loop* loop1;
+pthread_mutex_t lock;
+ev_async async_watcher;
+ev_async async_watcher1;
+char * buffer_glb;
+int socket_glb;
+
+// Объявляем функции --------------------------------------------------------------
+int port_my_us();// ----------------------------Запрашиваем порт у пользователя
+void error(const char *msg);// -----------------Ошибка
+void* loop1_river(void* args);// ---------------Добавленный поток (river)
+void read_client(struct ev_loop *loop,
+                    struct ev_io *watcher,
+                    int revents);// ------------Прочитать и отправить запрос (libev)
+void accept_client(struct ev_loop *loop,
+                    struct ev_io *watcher,
+                    int revents);// ------------Принять запрос (libev)
+static void change_client (EV_P_ ev_async *watcher,
+                            int revents);// ----Обработка сообщения (из добавленного потока) в главном потоке
+static void send_client (EV_P_ ev_async *watcher,
+                            int revents);// ----Отправить обработанное сообщение из добавленного потока
+
+// Определяем функции -------------------------------------------------------------
+void error(const char *msg)
+{
+    perror(msg);
+    exit(0);
+}
+//---------------------------------------------------------------------------------
+int port_my_us()
+{
+    int port_in;
+    char *port_st = malloc(sizeof(port_st));
+    
+    // Запускаем бесконечный цикл
+    for( ; ; )
+    {
+        // Считываем ввод пользователя, чистим буфер
+        printf("Please enter the port number (number from 1024 to 65535): ");
+        scanf("%[^\n]", port_st);
+        while ((getchar ()) != '\n');        
+
+        // Определяем размер считанных данных, переменные
+        int size = strlen(port_st);
+        char *str = "The port number is incorrect!";
+            
+        // Проверяем считанные данные на соответствие
+        for(int i=0; i<size; i++) 
+        {
+            if(port_st[i]>='0' && port_st[i]<='9')
+            {
+                if(i+1==size)
+                {
+                    port_in = atoi(port_st);
+                    if(port_in>=1024 && port_in<=65535)
+                        return port_in;
+                    else
+                        printf("%s\n", str);
+                }
+            }
+            else
+            {
+                printf("%s\n", str);
+                break;
+            }
+        }
+    }
+}
+//---------------------------------------------------------------------------------
+static void change_client (EV_P_ ev_async *watcher, int revents)
+{
+    // Защита от доступа с других потоков
+    pthread_mutex_lock(&lock);
+    printf("%s%s\n", "Accepted message: ", buffer_glb);
+
+    int nel = strlen(buffer_glb);
+    char blg_reffub[nel];    
+
+    // Переворачиваем сообщение задом наперед
+    for(int i=0, j=(nel-1); i<nel; i++, j--)
+        {
+            blg_reffub[i] = buffer_glb[j];
+            if(i == nel-1)
+                buffer_glb = blg_reffub;
+        }
+
+    buffer_glb[nel] = '\0';
+    pthread_mutex_unlock(&lock);
+
+    // Вызываем асинхронный наблюдатель (отправить обработанное сообщение)
+    if (ev_async_pending(&async_watcher1)==false)
+        ev_async_send(loop1, &async_watcher1);
+}
+//---------------------------------------------------------------------------------
+static void send_client (EV_P_ ev_async *watcher, int revents)
+{
+    // Защита от доступа с других потоков
+    // Отправляем обработанное сообщение обратно клиенту
+    pthread_mutex_lock(&lock);
+    printf("%s%s\n", "Finished message: ", buffer_glb);    
+    send(socket_glb, buffer_glb, strlen(buffer_glb), 0);    
+    pthread_mutex_unlock(&lock);    
+}
+//---------------------------------------------------------------------------------
+void read_client(struct ev_loop *loop1, struct ev_io *watcher, int revents)
+{
+    // Задаём переменную для буфера  
+    char buffer [4096];    
+
+    // Читаем сообщение 
+    ssize_t pack_size = recv(watcher->fd, &buffer, sizeof(buffer)-1, 0);
+    if (pack_size < 0) 
+        error("Read error");
+
+    // Если 0 байт, то закрыть "клиентский сокет", освободить память
+    if (pack_size == 0)
+    {        
+        ev_io_stop(loop1, watcher);
+        close(watcher->fd);
+        free(watcher);
+        printf("Сlient FD%d%s", watcher->fd, " closed the connection\n");
+        return;
+    } 
+        
+    buffer[pack_size] = '\0';    
+    
+    // Защита от доступа с других потоков
+    pthread_mutex_lock(&lock);
+    buffer_glb = buffer;
+    socket_glb = watcher->fd;
+    pthread_mutex_unlock(&lock);
+
+    // Вызываем асинхронный наблюдатель (обработка сообщения в главном потоке)
+    if (ev_async_pending(&async_watcher)==false)
+        ev_async_send(loop, &async_watcher);
+
+    // Для отправки обработанного сообщения из другого потока
+    // инициализируем и запускаем асинхронный наблюдатель
+    ev_async_init(&async_watcher1, send_client);
+    ev_async_start(loop1, &async_watcher1);
+    
+    return;
+}
+//---------------------------------------------------------------------------------
+void accept_client(struct ev_loop *loop1, struct ev_io *watcher, int revents)
+{
+    // Получаем запрос от клиента (сокет - дескриптор)
+    struct sockaddr_in client_addr;
+    socklen_t client_size = sizeof(client_addr);
+    int client = accept(watcher->fd, (struct sockaddr *) &client_addr, &client_size);
+    printf("Сlient FD%d%s", client, " to connection...\n");
+
+    // Создаём инициализируем и запускаем наблюдатель для "клиентского сокета"
+    struct ev_io *client_watcher = malloc(sizeof(struct ev_io));
+    ev_io_init(client_watcher, read_client, client, EV_READ); 
+    ev_io_start(loop1, client_watcher);
+
+    return;     
+}
+//---------------------------------------------------------------------------------
+void* loop1_river(void* args)
+{      
+    // Задаем номер порта
+    int port_my = port_my_us();
+
+    // Создаем сокет (дескриптор)
+    int socket_my = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (socket_my < 0)
+        error("ERROR to opening socket");
+
+    // Cвязываем адрес с сокетом
+    struct sockaddr_in addr;
+        addr.sin_family = PF_INET;
+        addr.sin_port = htons(port_my);
+        addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(socket_my, (struct sockaddr *) &addr, sizeof(addr)) < 0)
+        error("ERROR to bind socket");
+
+    // Помечает сокет в режим соединения (ставим на прослушку)
+    if (listen(socket_my, SOMAXCONN) < 0)
+        error("ERROR to listen socket");
+    else
+        printf("%s\n", "Server start...");
+
+    // Чистим структуру
+    bzero(&addr , sizeof(addr));
+
+    // Создаём инициализируем и запускаем наблюдатель
+    struct ev_io s_watcher;
+    ev_io_init(&s_watcher, accept_client, socket_my, EV_READ);
+    ev_io_start(loop1, &s_watcher);
+
+    // Ждём прихода событий
+    ev_run(loop1, EVFLAG_AUTO);
+
+    return 0;
+}
+//---------------------------------------------------------------------------------
+ 
+int main()//------------------------------------Главный поток (где работает main())
+{   
+    // Создаём основной цикл для обработки событий
+    loop = ev_default_loop(EVFLAG_AUTO);
+
+    // Добавляем цикл обработки событий
+    loop1 = ev_loop_new(EVFLAG_AUTO);
+    
+    // Для обработки сообщения из другого потока
+    // инициализируем и запускаем асинхронный наблюдатель
+    ev_async_init(&async_watcher, change_client);
+    ev_async_start(loop, &async_watcher);
+
+    // Добавляем поток, помещаем цикл loop1 в поток
+    pthread_t river;    
+    if (pthread_create(&river, NULL, loop1_river, NULL) != 0)
+        error("ERROR to create pthread");
+
+    // Инициализируем мьютекс
+    pthread_mutex_init(&lock, NULL);  
+
+    // Ждём прихода событий
+    ev_run(loop, EVFLAG_AUTO);
+
+    // Ожидаем завершения потока   
+    if (pthread_join(river, NULL) != 0)
+        error("ERROR to create pthread");
+        
+    // Уничтожаем мьютекс
+    pthread_mutex_destroy(&lock);
+        
+    return 0;
+    // Задание 2 – завершено --------------------------------------------------------------
+}
