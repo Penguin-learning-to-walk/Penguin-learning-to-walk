@@ -1,0 +1,152 @@
+#include <stdio.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <ev.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+// Объявляем функции --------------------------------------------------------------
+int port_my_us();// ----------------------------Запрашиваем порт у пользователя
+void error(const char *msg);// -----------------Ошибка
+void read_client(struct ev_loop *loop,
+                    struct ev_io *watcher,
+                    int revents);// ------------Прочитать и отправить запрос (libev)
+void accept_client(struct ev_loop *loop,
+                    struct ev_io *watcher,
+                    int revents);// ------------Принять запрос (libev)
+
+// Определяем функции -------------------------------------------------------------
+void error(const char *msg)
+{
+    perror(msg);
+    exit(0);
+}
+//---------------------------------------------------------------------------------
+int port_my_us()
+{
+    int port_in;
+    char *port_st = malloc(sizeof(port_st));
+    
+    // Запускаем бесконечный цикл
+    for( ; ; )
+    {
+        // Считываем ввод пользователя, чистим буфер
+        printf("Please enter the port number (number from 1024 to 65535): ");
+        scanf("%[^\n]", port_st);
+        while ((getchar ()) != '\n');        
+
+        // Определяем размер считанных данных, переменные
+        int size = strlen(port_st);
+        char *str = "The port number is incorrect!";
+            
+        // Проверяем считанные данные на соответствие
+        for(int i=0; i<size; i++) 
+        {
+            if(port_st[i]>='0' && port_st[i]<='9')
+            {
+                if(i+1==size)
+                {
+                    port_in = atoi(port_st);
+                    if(port_in>=1024 && port_in<=65535)
+                        return port_in;
+                    else
+                        printf("%s\n", str);
+                }
+            }
+            else
+            {
+                printf("%s\n", str);
+                break;
+            }
+        }
+    }
+}
+//---------------------------------------------------------------------------------
+void read_client(struct ev_loop *loop, struct ev_io *watcher, int revents)
+{
+    // Задаём переменную для буфера  
+    char buffer [4096];    
+
+    // Читаем сообщение 
+    ssize_t pack_size = recv(watcher->fd, &buffer, sizeof(buffer)-1, 0);
+    if (pack_size < 0) 
+        error("Read error");
+
+    // Если 0 байт, то закрыть "клиентский сокет", освободить память
+    if (pack_size == 0)
+    {        
+        ev_io_stop(loop, watcher);
+        close(watcher->fd);  
+        free(watcher);
+        printf("Сlient FD%d%s", watcher->fd, " closed the connection\n");
+        return;
+    } 
+    
+    // Выводим сообщение
+    buffer[pack_size] = '\0';
+    printf("%s%s\n", "Accepted message: ", buffer);      
+
+    // Отправляем сообщение обратно клиенту
+    send(watcher->fd, &buffer, pack_size, 0);
+    
+    return;
+}
+//---------------------------------------------------------------------------------
+void accept_client(struct ev_loop *loop, struct ev_io *watcher, int revents)
+{
+    // Получаем запрос от клиента (сокет - дескриптор)
+    struct sockaddr_in client_addr;
+    socklen_t client_size = sizeof(client_addr);
+    int client = accept(watcher->fd, (struct sockaddr *) &client_addr, &client_size);
+    printf("Сlient FD%d%s", client, " to connection...\n");
+
+    // Создаём инициализируем и запускаем наблюдатель для «клиентского сокета»
+    struct ev_io *client_watcher = malloc(sizeof(struct ev_io));
+    ev_io_init(client_watcher, read_client, client, EV_READ); 
+    ev_io_start(loop, client_watcher);
+
+    return;     
+}
+//---------------------------------------------------------------------------------
+ 
+int main()
+{   
+    // Задаем номер порта
+    int port_my = port_my_us();
+
+    // Создаем сокет (дескриптор)
+    int socket_my = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (socket_my < 0)
+        error("ERROR to opening socket");
+
+    // Cвязываем адрес с сокетом
+    struct sockaddr_in addr;
+        addr.sin_family = PF_INET;
+        addr.sin_port = htons(port_my);
+        addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(socket_my, (struct sockaddr *) &addr, sizeof(addr)) < 0)
+        error("ERROR to bind socket");
+
+    // Помечает сокет в режим соединения (ставим на прослушку)
+    if (listen(socket_my, SOMAXCONN) < 0)
+        error("ERROR to listen socket");
+     else
+        printf("%s\n", "Server start...");
+
+    // Чистим структуру
+    bzero(&addr , sizeof(addr));
+    
+    // Создаём основной цикл для обработки событий
+    struct ev_loop *loop = ev_default_loop(EVFLAG_AUTO); 
+
+    // Создаём инициализируем и запускаем наблюдатель
+    struct ev_io s_watcher;
+    ev_io_init(&s_watcher, accept_client, socket_my, EV_READ);
+    ev_io_start(loop, &s_watcher);
+
+    // Ждём прихода событий
+    ev_run(loop, EVFLAG_AUTO);
+        
+    return 0;
+    // Задание 1 – завершено --------------------------------------------------------------
+}
