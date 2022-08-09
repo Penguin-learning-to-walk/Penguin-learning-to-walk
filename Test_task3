@@ -1,0 +1,313 @@
+#include <stdio.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <ev.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <net/if.h>
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
+#include <linux/filter.h>
+#include <arpa/inet.h>
+#include <sys/ioctl.h>
+
+// Объявляем переменные -----------------------------------------------------------
+struct ev_loop* loop;
+struct ev_loop* loop1;
+struct if_nameindex *nameif,*ifor;
+struct sockaddr_ll llinface;
+struct ifreq ifroutface;
+struct sockaddr_in dest_out;
+pthread_mutex_t lock;
+ev_async async_watcher;
+ev_async async_watcher1;
+char * buffer_glb;
+int socket_glb;
+
+// Объявляем функции --------------------------------------------------------------
+void error(const char *msg);// -----------------Ошибка
+void netface();// ------------------------------Узнаём имя/индекс сетевых интерфейсов, заполняем структуры
+int socket_inf();// ----------------------------Сокет входящего сетевого интерфейса
+int socket_outf();// ---------------------------Сокет выходящего сетевого интерфейса
+void* loop1_river(void* args);// ---------------Добавленный поток (river)
+void accept_client(struct ev_loop *loop,
+                    struct ev_io *watcher,
+                    int revents);// ------------Принять запрос (libev)
+static void change_client (EV_P_ ev_async *watcher,
+                            int revents);// ----Обработка сообщения (из добавленного потока) в главном потоке
+static void send_client (EV_P_ ev_async *watcher,
+                            int revents);// ----Отправить обработанное сообщение из добавленного потока
+
+// Определяем функции -------------------------------------------------------------
+void error(const char *msg)
+{
+    perror(msg);
+    exit(0);
+}
+//---------------------------------------------------------------------------------
+void netface()
+{
+    // Чистим структуры
+    bzero(&nameif , sizeof(nameif));
+    bzero(&llinface , sizeof(llinface));
+    bzero(&ifroutface , sizeof(ifroutface));
+
+    // Получаем массив структур имя/индекс сетевых интерфейсов
+    nameif = if_nameindex();
+    if (nameif == 0)
+        error("Network interface names/indexes error");
+
+    // Выводим имя/индекс сетевых интерфейсов
+    printf("%s\n", "All network interface names and indexes:");
+    for (ifor=nameif; (ifor->if_index!=0 && ifor->if_name!=0); ifor++)
+        printf("index:%u name:%s\n", ifor->if_index, ifor->if_name);
+
+    // Переменные для буфера пользователя
+    char *inface = malloc(sizeof(inface));
+    char *outface = malloc(sizeof(outface));
+    
+    for( ; ; )
+    {
+        // Запрашиваем имена входного интерфейса
+        printf("%s\n", "Please enter name of the incoming network interface:");
+        scanf("%[^\n]", inface);
+        while ((getchar ()) != '\n');
+        
+        // Проверяем считанные данные на соответствие
+        for (ifor=nameif; (ifor->if_index!=0 && ifor->if_name!=0); ifor++)
+        {
+            if(strncmp(ifor->if_name, inface, strlen(inface)) == 0)
+                if(strlen(inface) == strlen(ifor->if_name))
+                {
+                    // Заполняем структуру sockaddr_ll входного интерфейса (пакетный сокет)
+                    llinface.sll_family = AF_PACKET;
+                    llinface.sll_ifindex = ifor->if_index;
+                    llinface.sll_protocol = htons(ETH_P_ALL);
+                }
+        }
+
+        if(llinface.sll_ifindex!=0)
+            break;
+        printf("%s\n", "Unable to find interface");
+    }
+    
+    for( ; ; )
+    {
+        // Запрашиваем имена входного интерфейса
+        printf("%s\n", "Please enter name of the outgoing network interface:");
+        scanf("%[^\n]", outface);
+        while ((getchar ()) != '\n');
+        
+        // Проверяем считанные данные на соответствие
+        for (ifor=nameif; (ifor->if_index!=0 && ifor->if_name!=0); ifor++)
+        {
+            if(strncmp(ifor->if_name, outface, strlen(outface)) == 0)
+                if(strlen(outface) == strlen(ifor->if_name))
+                {
+                    // Задаём имя выходного интерфейса в структуре ifreq (сырой сокет)
+                    sprintf(ifroutface.ifr_name, "%s", outface);
+                }
+        }
+
+        if(strlen(ifroutface.ifr_name)!=0)
+            break;
+        printf("%s\n", "Unable to find interface");
+    }
+}
+//---------------------------------------------------------------------------------
+int socket_inf()
+{
+    // Создаём пакетный сокет
+    int socket_my_in = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (socket_my_in < 0)
+        error("ERROR to opening socket");
+    
+    // Переводим интерфейс в неразборчивый режим
+    struct packet_mreq mreq;
+    mreq.mr_ifindex = llinface.sll_ifindex;
+    mreq.mr_type = PACKET_MR_PROMISC;
+
+    if (setsockopt(socket_my_in, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == -1)
+        error("ERROR packet_mreq");
+    
+    // Привязываем сокет к интерфейсу
+    if((bind(socket_my_in, (struct sockaddr*) &llinface, sizeof(llinface))) < 0)
+        error("ERROR to bind socket");
+
+    // Создаем фильтр для приема только UDP
+    struct sock_fprog filter_udp;
+    struct sock_filter bpf_code[] = {
+        BPF_STMT(BPF_LD+BPF_B+BPF_ABS, 23),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_IMM, IPPROTO_UDP, 0, 1),
+        BPF_STMT(BPF_RET+BPF_K,1500),
+        BPF_STMT(BPF_RET+BPF_K,0),
+    };
+
+    filter_udp.len = 4;
+    filter_udp.filter = bpf_code;
+
+    // Назначаем фильтр сокету
+    if(setsockopt(socket_my_in, SOL_SOCKET, SO_ATTACH_FILTER, &filter_udp, sizeof(struct sock_fprog))<0)
+        error("ERROR to bind filter");
+
+    return (socket_my_in);
+}
+//---------------------------------------------------------------------------------
+int socket_outf()
+{
+    // Создаём сырой сокет
+    int socket_my_out = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+    if (socket_my_out < 0)
+        error("ERROR to opening socket");
+
+    // Включение заголовков автоматически
+    int hdrincl=1;
+    if (setsockopt(socket_my_out,IPPROTO_IP,IP_HDRINCL,&hdrincl,sizeof(hdrincl))==-1)
+        error("ERROR IP_HDRINCL");
+
+    // Привязываем сокет к интерфейсу
+    if(setsockopt(socket_my_out, SOL_SOCKET, SO_BINDTODEVICE, (void*) &ifroutface, sizeof(struct ifreq))<0)
+        error("ERROR to bind socket");
+
+    // Получаем IP-адрес интерфейса
+    ioctl(socket_my_out, SIOCGIFADDR, &ifroutface);        
+
+    return (socket_my_out);
+}
+//---------------------------------------------------------------------------------
+static void change_client (EV_P_ ev_async *watcher, int revents)
+{
+    // Защита от доступа с других потоков
+    pthread_mutex_lock(&lock);
+    printf("\n%s\n%s\n", "Accepted message: ", buffer_glb);
+
+    int nel = strlen(buffer_glb);
+    char blg_reffub[nel];
+
+    // Переворачиваем сообщение задом наперед
+    for(int i=0, j=(nel-1); i<nel; i++, j--)
+        {
+            blg_reffub[i] = buffer_glb[j];
+            if(i == nel-1)
+                buffer_glb = blg_reffub;
+        }
+
+    buffer_glb[nel] = '\0';
+    pthread_mutex_unlock(&lock);
+
+    // Вызываем асинхронный наблюдатель (отправить обработанное сообщение)
+    if (ev_async_pending(&async_watcher1)==false)
+        ev_async_send(loop1, &async_watcher1);
+}
+//---------------------------------------------------------------------------------
+static void send_client (EV_P_ ev_async *watcher, int revents)
+{
+    // Защита от доступа с других потоков
+    // Отправляем обработанное сообщение обратно клиенту
+    pthread_mutex_lock(&lock);
+    printf("\n%s%s\n", "Finished message: ", buffer_glb);
+    sendto(socket_glb, buffer_glb, strlen(buffer_glb), 0, (struct sockaddr*) &dest_out, sizeof(struct sockaddr_in));
+    pthread_mutex_unlock(&lock);
+}
+//---------------------------------------------------------------------------------
+void accept_client(struct ev_loop *loop1, struct ev_io *watcher, int revents)
+{
+    // Задаём буфер для входящих пакетов
+    uint8_t buffer[ETH_FRAME_LEN];
+    bzero(buffer, ETH_FRAME_LEN);
+
+    // Читаем сообщение в буфер
+    int rec = recvfrom(watcher->fd, buffer, ETH_FRAME_LEN, 0, 0, 0);
+    if(rec<0 || rec>ETH_FRAME_LEN)
+        error("Receive a message error");
+    
+    // Чистим и заполняем структуру (sockaddr_in) данными с заголовков
+    bzero(&dest_out , sizeof(dest_out));
+    dest_out.sin_family = AF_INET;
+    struct in_addr iaddr = {*(uint32_t*)(buffer+14+12)};    
+    dest_out.sin_addr = iaddr;
+    dest_out.sin_port = ntohs(*(uint16_t*)(buffer+14+20));
+
+    printf("\nSenderAddr:%15s\n", inet_ntoa(dest_out.sin_addr));
+    printf("SenderPort:%15d\n", dest_out.sin_port);
+
+    // Записываем данные пакета(payload)
+    char buffer_rec[rec-14-20-8];
+    memcpy(buffer_rec,buffer+14+20+8,rec-14-20-8);//------------------- Не корректно Примечание1
+                                                            //{  Необходимо сформировать          
+    // Защита от доступа с других потоков                   //   побайтный парсинг и других  
+    pthread_mutex_lock(&lock);                              //   протоколов, константы смещений,  
+    buffer_glb = buffer_rec;                                //   корректное извлечение (payload),
+    pthread_mutex_unlock(&lock);                            //   проверку контрольной суммы }
+
+    // Вызываем асинхронный наблюдатель (обработка сообщения в главном потоке)
+    if (ev_async_pending(&async_watcher)==false)
+    ev_async_send(loop, &async_watcher);
+
+    // Для отправки обработанного сообщения из другого потока
+    // инициализируем и запускаем асинхронный наблюдатель
+    ev_async_init(&async_watcher1, send_client);
+    ev_async_start(loop1, &async_watcher1);
+    
+    return;     
+}
+//---------------------------------------------------------------------------------
+void* loop1_river(void* args)
+{
+    // Узнаём имя/индекс сетевых интерфейсов
+    netface();
+
+    // Создаём сокеты входящего/выходящего сетевых интерфейсов
+    int fd_in = socket_inf();
+    int fd_out = socket_outf();
+    socket_glb = fd_out;
+    printf("%s\n", "Server start...");
+
+    // Создаём инициализируем и запускаем наблюдатель
+    struct ev_io s_watcher;
+    ev_io_init(&s_watcher, accept_client, fd_in, EV_READ);
+    ev_io_start(loop1, &s_watcher);
+
+    // Ждём прихода событий
+    ev_run(loop1, EVFLAG_AUTO);
+
+    return 0;
+}
+//---------------------------------------------------------------------------------
+ 
+int main()//------------------------------------Главный поток (где работает main())
+{
+    // Создаём основной цикл для обработки событий
+    loop = ev_default_loop(EVFLAG_AUTO);
+
+    // Добавляем цикл обработки событий
+    loop1 = ev_loop_new(EVFLAG_AUTO);
+    
+    // Для обработки сообщения из другого потока
+    // инициализируем и запускаем асинхронный наблюдатель
+    ev_async_init(&async_watcher, change_client);
+    ev_async_start(loop, &async_watcher);
+
+    // Добавляем поток, помещаем цикл loop1 в поток
+    pthread_t river;    
+    if (pthread_create(&river, NULL, loop1_river, NULL) != 0)
+        error("ERROR to create pthread");
+
+    // Инициализируем мьютекс
+    pthread_mutex_init(&lock, NULL);  
+
+    // Ждём прихода событий
+    ev_run(loop, EVFLAG_AUTO);
+
+    // Ожидаем завершения потока   
+    if (pthread_join(river, NULL) != 0)
+        error("ERROR to create pthread");
+        
+    // Уничтожаем мьютекс
+    pthread_mutex_destroy(&lock);
+        
+    return 0;
+    // Задание 3 – завершено --------------------------------------------------------------
+}
